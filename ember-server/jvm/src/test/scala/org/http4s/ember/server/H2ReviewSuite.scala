@@ -82,4 +82,34 @@ class H2ReviewSuite extends Http4sSuite {
       exchange(app, Stream.emits(Array.fill[Byte](size)(0)), size.toString, 500.millis)
     }
   }
+
+  test("reproduce race condition".only) {
+    val numIterations =
+      10L // Since this is a race condition, we need to execute the codepath multiple times.
+    val app = HttpApp[IO](_ => Response[IO](Status.Ok).pure[IO])
+    val server = EmberServerBuilder
+      .default[IO]
+      .withHost(ipv4"127.0.0.1")
+      .withPort(port"0")
+      .withHttp2
+      .withHttpApp(app)
+      .build
+    val client = EmberClientBuilder.default[IO].withHttp2.build
+    (server, client).tupled.use { case (server, client) =>
+      val uri = Uri.unsafeFromString(s"http://127.0.0.1:${server.addressIp4s.port.value}/")
+      val req = Request[IO](Method.POST, uri)
+        .withEntity("Somebody")
+        .withAttribute(Http2PriorKnowledge, ())
+      val program = (
+        // Make two requests in parallel. One of them will be cancelled due to race.
+        // This causes the client to send an RstStream cancel message.
+        // Occasionally, the server may send data before it has received the message.
+        // This causes the client to misbehave and stop any concurrent requests.
+        client.expect[String](req).race(client.expect[String](req)),
+        // Send a concurrent request to surface the exception.
+        client.expect[String](req),
+      ).parTupled.void
+      Stream.repeatEval(program).take(numIterations).compile.drain
+    }
+  }
 }
