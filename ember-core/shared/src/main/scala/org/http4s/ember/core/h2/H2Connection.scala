@@ -56,6 +56,9 @@ private[h2] class H2Connection[F[_]](
     socket: Socket[F],
     logger: Logger[F],
 )(implicit F: Temporal[F]) {
+  // Added for troubleshooting
+  def logSize(name: String): F[Unit] =
+    outgoingQueue.size.flatMap(size => logger.info(s"At $name outgoing queue has size $size"))
 
   private[this] def addrStr = address.toString
 

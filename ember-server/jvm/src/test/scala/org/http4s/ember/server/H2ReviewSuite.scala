@@ -83,7 +83,8 @@ class H2ReviewSuite extends Http4sSuite {
     }
   }
 
-  test("reproduce race condition".only) {
+  test("reproduce race condition") {
+    // TODO: Zainab - Remove the goaway and see what happens.
     val numIterations =
       10L // Since this is a race condition, we need to execute the codepath multiple times.
     val app = HttpApp[IO](_ => Response[IO](Status.Ok).pure[IO])
@@ -111,5 +112,88 @@ class H2ReviewSuite extends Http4sSuite {
       ).parTupled.void
       Stream.repeatEval(program).take(numIterations).compile.drain
     }
+  }
+
+  test("reproduce another deadlock") {
+    val responseTime = 2.seconds
+    val app = HttpApp[IO](_ => IO.sleep(responseTime) >> Response[IO](Status.Ok).pure[IO])
+    val server = EmberServerBuilder
+      .default[IO]
+      .withHost(ipv4"127.0.0.1")
+      .withPort(port"0")
+      .withHttp2
+      // Drop the connection as soon as we stop the server, rather than waiting
+      // for the client to notice.
+      .withShutdownTimeout(0.nanos)
+      .withHttpApp(app)
+      .build
+    val client = EmberClientBuilder
+      .default[IO]
+      .withHttp2
+      .build
+
+    Deferred[IO, Port].flatMap { port =>
+      // Start the server, then stop it immediately.
+      val startAndKillServer = server.use { server =>
+        port.complete(server.addressIp4s.port) >> IO.sleep(1.second)
+      }
+
+      val runClient = client.use { client =>
+        // Wait for the server to start
+        port.get.flatMap { port =>
+          val uri = Uri.unsafeFromString(s"http://127.0.0.1:${port.value}/")
+          val req = Request[IO](Method.POST, uri)
+            .withEntity("Somebody")
+            .withAttribute(Http2PriorKnowledge, ())
+          // Make a request
+          client.expect[String](req).timeout(5.seconds)
+        }
+      }
+      (startAndKillServer, runClient).parTupled.void
+    }
+  }
+
+  test("reproduce uncancellable deadlock".only) {
+    val shutdownServerDelay = 1.second
+    val app = HttpApp[IO](_ => Response[IO](Status.Ok).pure[IO])
+    val server = EmberServerBuilder
+      .default[IO]
+      .withHost(ipv4"127.0.0.1")
+      .withPort(port"0")
+      .withHttp2
+      // Drop the connection as soon as we stop the server. This breaks the pipe.
+      .withShutdownTimeout(0.seconds)
+      .withHttpApp(app)
+      .build
+    val client = EmberClientBuilder
+      .default[IO]
+      .withHttp2
+      .build
+
+    Deferred[IO, Port].flatMap { port =>
+      // Start the server, then stop it after a second.
+      val startAndShutdownServer = server.use { server =>
+        port.complete(server.addressIp4s.port) >> IO.sleep(shutdownServerDelay)
+      }
+
+      val runClient = client.use { client =>
+        // Wait for the server to start
+        port.get.flatMap { port =>
+          val uri = Uri.unsafeFromString(s"http://127.0.0.1:${port.value}/")
+          val req = Request[IO](Method.POST, uri)
+            .withEntity("Somebody")
+            .withAttribute(Http2PriorKnowledge, ())
+          val makeFirstReq = client.expect[String](req)
+          val waitForServerToShutdown = IO.sleep(shutdownServerDelay)
+          val makeManyConcurrentRequests = Stream[IO, Request[IO]](req)
+              .repeatN(60)
+              .parEvalMapUnbounded(client.expect[String])
+              .compile
+              .drain
+          makeFirstReq >> waitForServerToShutdown >> makeManyConcurrentRequests
+        }
+      }
+      (startAndShutdownServer, runClient).parTupled.void
+    }.timeout(5.seconds)
   }
 }

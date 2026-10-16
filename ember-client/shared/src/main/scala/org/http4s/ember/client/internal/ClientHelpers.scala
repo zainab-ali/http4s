@@ -49,7 +49,6 @@ import org.http4s.headers.`User-Agent`
 import org.typelevel.ci._
 import org.typelevel.keypool._
 import org.typelevel.log4cats.Logger
-
 import java.io.IOException
 import scala.concurrent.duration._
 

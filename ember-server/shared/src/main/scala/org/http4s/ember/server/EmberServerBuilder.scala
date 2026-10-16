@@ -248,7 +248,7 @@ final class EmberServerBuilder[F[_]: Async: Network] private (
   def withMaxWebSocketMessageSize(maxWebSocketMessageSize: Int): EmberServerBuilder[F] =
     copy(maxWebSocketMessageSize = maxWebSocketMessageSize)
 
-  def build: Resource[F, Server] =
+    def build: Resource[F, Server] =
     for {
       _ <-
         if (unixSocketConfig.isDefined && enableHttp2)
