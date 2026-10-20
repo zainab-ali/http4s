@@ -46,7 +46,7 @@ private[h2] class H2Connection[F[_]](
     val state: Ref[F, H2Connection.State[F]], // odd if client, even if server
     val pendingReadCredit: SignallingRef[F, Int],
     val writeWindow: H2Connection.WriteWindow[F],
-    outgoingQueue: cats.effect.std.Queue[F, H2Frame],
+    outgoingQueue: Channel[F, H2Frame],
     val createdStreams: cats.effect.std.Queue[F, Int],
     val closedStreams: cats.effect.std.Queue[F, Int],
     hpack: Hpack[F],
@@ -58,7 +58,9 @@ private[h2] class H2Connection[F[_]](
 )(implicit F: Temporal[F]) {
   // Added for troubleshooting
   def logSize(name: String): F[Unit] =
-    outgoingQueue.size.flatMap(size => logger.info(s"At $name outgoing queue has size $size"))
+    outgoingQueue.isClosed.flatMap(closed =>
+      logger.info(s"At $name outgoing queue is closed: $closed")
+    )
 
   private[this] def addrStr = address.toString
 
@@ -278,12 +280,12 @@ private[h2] class H2Connection[F[_]](
         def go(data: H2Frame.Data): F[Unit] =
           F.bracketFull(poll => poll(writeWindow.take(data.flowControlSize))) { available =>
             if (available == data.flowControlSize)
-              outgoingQueue.offer(data).as(Option.empty[H2Frame.Data])
+              outgoingQueue.send(data).as(Option.empty[H2Frame.Data])
             else if (available > 0) {
               val (head, tail) = data.data.splitAt(available.toLong)
               val headFrame = data.copy(data = head, pad = None, endStream = false)
               val tailFrame = data.copy(data = tail)
-              outgoingQueue.offer(headFrame).as(tailFrame.some)
+              outgoingQueue.send(headFrame).as(tailFrame.some)
             } else
               F.pure(data.some)
           } {
@@ -297,7 +299,7 @@ private[h2] class H2Connection[F[_]](
           }
 
         withStallTimeout(go(data))
-      case other: H2Frame => outgoingQueue.offer(other)
+      case other: H2Frame => outgoingQueue.send(other).void
     }
 
   private[this] def withStallTimeout[A](fa: F[Unit]): F[Unit] =
@@ -356,9 +358,8 @@ private[h2] class H2Connection[F[_]](
   }
 
   def writeLoop: Stream[F, Nothing] =
-    Stream
-      .fromQueueUnterminated[F, H2Frame](outgoingQueue, 16)
-      .chunks
+    outgoingQueue.stream
+      .chunkLimit(16)
       .foreach(writeChunk)
       .concurrently(sendReadWindowUpdates)
       .handleErrorWith(ex =>
@@ -367,6 +368,8 @@ private[h2] class H2Connection[F[_]](
             state.update(_.copy(closed = true))
         )
       )
+      // Close and drain the channel to release any blocked senders.
+      .onFinalize(outgoingQueue.close >> outgoingQueue.stream.drain.compile.drain)
 
   def readLoop: F[Unit] = {
 
@@ -719,7 +722,7 @@ private[h2] class H2Connection[F[_]](
                     logger.debug(
                       s"$addrStr Received Data Frame for Closed Stream $i - Resetting"
                     ) >>
-                      outgoingQueue.tryOffer(H2Error.StreamClosed.toRst(i)).void
+                      outgoingQueue.trySend(H2Error.StreamClosed.toRst(i)).void
                 })
               case None =>
                 logger.warn(

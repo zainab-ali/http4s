@@ -22,6 +22,7 @@ import cats.effect.syntax.all._
 import cats.syntax.all._
 import com.comcast.ip4s._
 import fs2._
+import fs2.concurrent.Channel
 import fs2.concurrent.SignallingRef
 import fs2.io.net._
 import fs2.io.net.tls._
@@ -192,7 +193,7 @@ private[ember] class H2Client[F[_]](
         )
         pendingReadCredit <- SignallingRef[F, Int](0)
         writeWindow <- H2Connection.WriteWindow.init[F](defaultSettings.initialWindowSize)
-        queue <- cats.effect.std.Queue.bounded[F, H2Frame](128)
+        queue <- Channel.bounded[F, H2Frame](128)
         hpack <- Hpack.create[F](
           localSettings.maxHeaderListSize.fold(Int.MaxValue)(_.listSize)
         )

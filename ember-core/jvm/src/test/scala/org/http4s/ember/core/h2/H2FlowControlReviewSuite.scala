@@ -25,6 +25,7 @@ import com.comcast.ip4s._
 import fs2.Chunk
 import fs2.Pipe
 import fs2.Stream
+import fs2.concurrent.Channel
 import fs2.concurrent.SignallingRef
 import fs2.io.net.Socket
 import fs2.io.net.SocketOption
@@ -43,7 +44,7 @@ class H2FlowControlReviewSuite extends H2Suite {
   private val settings = H2Frame.Settings.ConnectionSettings.default
 
   private def connection(
-      outgoing: Queue[IO, H2Frame],
+      outgoing: Channel[IO, H2Frame],
       writeBytes: Chunk[Byte] => IO[Unit],
       connectionType: H2Connection.ConnectionType = H2Connection.ConnectionType.Server,
       input: ByteVector = ByteVector.empty,
@@ -140,7 +141,7 @@ class H2FlowControlReviewSuite extends H2Suite {
     test(s"$role sends cancelled readers' connection grants after stream release") {
       val window: Int = settings.initialWindowSize.windowSize
       TestControl.executeEmbed(for {
-        outgoing <- Queue.bounded[IO, H2Frame](128)
+        outgoing <- Channel.bounded[IO, H2Frame](128)
         writing <- Deferred[IO, Unit]
         resume <- Deferred[IO, Unit]
         written <- Ref[IO].of(ByteVector.empty)
@@ -151,9 +152,9 @@ class H2FlowControlReviewSuite extends H2Suite {
         )
         _ <- h2.writeLoop.compile.drain.background.use { _ =>
           for {
-            _ <- outgoing.offer(H2Frame.Ping.ack)
+            _ <- outgoing.send(H2Frame.Ping.ack)
             _ <- writing.get
-            _ <- outgoing.offer(H2Frame.Ping.ack).replicateA_(128)
+            _ <- outgoing.send(H2Frame.Ping.ack).replicateA_(128)
             streams <- Stream
               .emits(List((1, 32768), (3, 16383), (5, 16384)))
               .covary[IO]
@@ -193,7 +194,7 @@ class H2FlowControlReviewSuite extends H2Suite {
       val window = settings.initialWindowSize.windowSize
       val batch = window / 2
       for {
-        outgoing <- Queue.bounded[IO, H2Frame](1)
+        outgoing <- Channel.bounded[IO, H2Frame](1)
         writing <- Deferred[IO, Unit]
         resume <- Deferred[IO, Unit]
         written <- Ref[IO].of(ByteVector.empty)
@@ -203,9 +204,9 @@ class H2FlowControlReviewSuite extends H2Suite {
         )
         _ <- h2.writeLoop.compile.drain.background.use { _ =>
           (for {
-            _ <- outgoing.offer(H2Frame.Ping.ack)
+            _ <- outgoing.send(H2Frame.Ping.ack)
             _ <- writing.get
-            _ <- outgoing.offer(H2Frame.Ping.ack)
+            _ <- outgoing.send(H2Frame.Ping.ack)
             first <- receiveBody(h2, 1, batch)
             second <- receiveBody(h2, 3, batch)
             _ <- first.receiveRstStream(H2Error.Cancel.toRst(1))
@@ -225,14 +226,14 @@ class H2FlowControlReviewSuite extends H2Suite {
   test("connection shutdown completes under outgoing backpressure") {
     TestControl.executeEmbed {
       (for {
-        outgoing <- Queue.bounded[IO, H2Frame](1)
+        outgoing <- Channel.bounded[IO, H2Frame](1)
         writing <- Deferred[IO, Unit]
         h2 <- connection(outgoing, _ => writing.complete(()) >> IO.never)
         _ <- h2.writeLoop.compile.drain.background.use { _ =>
           for {
-            _ <- outgoing.offer(H2Frame.Ping.ack)
+            _ <- outgoing.send(H2Frame.Ping.ack)
             _ <- writing.get
-            _ <- outgoing.offer(H2Frame.Ping.ack)
+            _ <- outgoing.send(H2Frame.Ping.ack)
             stream <- receiveBody(h2, 1, 32768)
             _ <- stream.readBody.take(32768).compile.drain
             _ <- IO.sleep(1.second)
@@ -246,7 +247,7 @@ class H2FlowControlReviewSuite extends H2Suite {
     TestControl.executeEmbed {
       val window: Int = settings.initialWindowSize.windowSize
       for {
-        outgoing <- Queue.bounded[IO, H2Frame](128)
+        outgoing <- Channel.bounded[IO, H2Frame](128)
         written <- Ref[IO].of(ByteVector.empty)
         h2 <- connection(
           outgoing,
@@ -291,7 +292,7 @@ class H2FlowControlReviewSuite extends H2Suite {
   test("the credit sender grants stream credit below the connection batching threshold") {
     TestControl.executeEmbed {
       for {
-        outgoing <- Queue.bounded[IO, H2Frame](128)
+        outgoing <- Channel.bounded[IO, H2Frame](128)
         written <- Ref[IO].of(ByteVector.empty)
         firstRead <- Deferred[IO, Unit]
         resumeRead <- Deferred[IO, Unit]
@@ -338,7 +339,7 @@ class H2FlowControlReviewSuite extends H2Suite {
       TestControl.executeEmbed {
         val window: Int = settings.initialWindowSize.windowSize
         for {
-          outgoing <- Queue.bounded[IO, H2Frame](128)
+          outgoing <- Channel.bounded[IO, H2Frame](128)
           written <- Ref[IO].of(ByteVector.empty)
           creditSent <- Deferred[IO, FiniteDuration]
           h2 <- connection(
@@ -391,7 +392,7 @@ class H2FlowControlReviewSuite extends H2Suite {
     TestControl.executeEmbed {
       val window: Int = settings.initialWindowSize.windowSize
       for {
-        outgoing <- Queue.bounded[IO, H2Frame](128)
+        outgoing <- Channel.bounded[IO, H2Frame](128)
         written <- Ref[IO].of(ByteVector.empty)
         h2 <- connection(
           outgoing,
@@ -430,7 +431,7 @@ class H2FlowControlReviewSuite extends H2Suite {
       )
     })
     for {
-      outgoing <- Queue.bounded[IO, H2Frame](128)
+      outgoing <- Channel.bounded[IO, H2Frame](128)
       reads <- Ref[IO].of(0)
       parsed <- Deferred[IO, Unit]
       h2 <- connection(
@@ -487,7 +488,7 @@ class H2FlowControlReviewSuite extends H2Suite {
         val input = ByteVector.concat(List.fill(128)(H2Frame.toByteVector(data))) ++
           H2Frame.toByteVector(H2Frame.WindowUpdate(0, 1))
         for {
-          outgoing <- Queue.bounded[IO, H2Frame](128)
+          outgoing <- Channel.bounded[IO, H2Frame](128)
           h2 <- connection(
             outgoing,
             _ => IO.unit,
@@ -498,13 +499,13 @@ class H2FlowControlReviewSuite extends H2Suite {
           stream <- receiveBody(h2, 1, 16384)
           // The handler reads a prefix, then pauses with less than half a window consumed.
           _ <- stream.readBody.take(16384).compile.drain
-          _ <- outgoing.offer(H2Frame.Ping.ack).replicateA_(128)
+          _ <- outgoing.send(H2Frame.Ping.ack).replicateA_(128)
           _ <- h2.readLoop.background.use { _ =>
             for {
               _ <- IO.sleep(1.second)
               before <- h2.writeWindow.available
               // Freeing one queue slot proves what prevented read-loop progress.
-              _ <- outgoing.take
+              _ <- outgoing.stream.head.compile.drain
               _ <- IO.sleep(1.second)
               after <- h2.writeWindow.available
               _ = assertEquals(after, 1)
