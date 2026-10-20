@@ -316,7 +316,12 @@ private[ember] class H2Client[F[_]](
           connection.mapRef.update(m => m - stream.id)
       )
       _ <- (stream.sendMessageBody(req) >> stream.sendTrailerHeaders(req)).background
-      resp <- Resource.eval(stream.getResponse).map(_.covary[F].withBodyStream(stream.readBody))
+      resp <- Resource
+        .eval(stream.getResponse)
+        .map(_.covary[F].withBodyStream(stream.readBody))
+        .onFinalizeCase(exitCase =>
+          logger.info(s"getResponse completed for stream ${stream.id} with exit case ${exitCase}")
+        )
     } yield resp
   }
 }

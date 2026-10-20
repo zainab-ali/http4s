@@ -105,4 +105,47 @@ class H2ReviewSuite extends Http4sSuite {
       Stream.repeatEval(program).take(10).compile.drain.timeout(8.seconds)
     }
   }
+
+  test("reproduce deadlock in getResponse".only) {
+    val shutdownServerDelay = 1.second
+    // Do not send a response. The server will stop before sending any data.
+    val app = HttpApp[IO](_ => IO.never)
+    val server = EmberServerBuilder
+      .default[IO]
+      .withHost(ipv4"127.0.0.1")
+      .withPort(port"0")
+      .withHttp2
+      // Drop the connection as soon as we stop the server
+      .withShutdownTimeout(0.nanos)
+      .withHttpApp(app)
+      .build
+    val client = EmberClientBuilder
+      .default[IO]
+      .withHttp2
+      .build
+
+    Deferred[IO, Port].flatMap { port =>
+      // Start the server, then stop it immediately.
+      val startAndKillServer = server.use { server =>
+        port.complete(server.addressIp4s.port) >> IO.sleep(shutdownServerDelay)
+      }
+
+      val runClient = client.use { client =>
+        // Wait for the server to start
+        port.get.flatMap { port =>
+          val uri = Uri.unsafeFromString(s"http://127.0.0.1:${port.value}/")
+          val req = Request[IO](Method.POST, uri)
+            .withEntity("Somebody")
+            .withAttribute(Http2PriorKnowledge, ())
+          // Make a request.
+          // The server terminates before responding to the request. The read loop terminates, and the request is left hanging.
+          client
+            .expect[String](req)
+            // The request times out
+            .timeout(5.seconds)
+        }
+      }
+      (startAndKillServer, runClient).parTupled.void
+    }
+  }
 }
