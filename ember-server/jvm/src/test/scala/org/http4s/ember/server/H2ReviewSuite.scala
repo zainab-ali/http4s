@@ -17,6 +17,7 @@
 package org.http4s.ember.server
 
 import cats.effect._
+import cats.effect.unsafe.IORuntime
 import cats.syntax.all._
 import com.comcast.ip4s._
 import fs2.Stream
@@ -105,4 +106,70 @@ class H2ReviewSuite extends Http4sSuite {
       Stream.repeatEval(program).take(10).compile.drain.timeout(8.seconds)
     }
   }
+
+  test("reproduce uncancellable deadlock".only) {
+    val shutdownServerDelay = 1.second
+    val app = HttpApp[IO](_ => Response[IO](Status.Ok).pure[IO])
+    val server = EmberServerBuilder
+      .default[IO]
+      .withHost(ipv4"127.0.0.1")
+      .withPort(port"0")
+      .withHttp2
+      // Drop the connection as soon as we stop the server. This causes a Broken Pipe exception to be raised in the client's write loop.
+      .withShutdownTimeout(0.seconds)
+      .withHttpApp(app)
+      .build
+    val client = EmberClientBuilder
+      .default[IO]
+      .withHttp2
+      .build
+
+    val simulateDeadlock = Deferred[IO, Port]
+      .flatMap { port =>
+        // Start the server, then stop it after a second.
+        val startAndShutdownServer = server.use { server =>
+          port.complete(server.addressIp4s.port) >> IO.sleep(shutdownServerDelay)
+        }
+
+        val runClient = client.use { client =>
+          // Wait for the server to start
+          port.get.flatMap { port =>
+            val uri = Uri.unsafeFromString(s"http://127.0.0.1:${port.value}/")
+            val req = Request[IO](Method.POST, uri)
+              .withEntity("Somebody")
+              .withAttribute(Http2PriorKnowledge, ())
+            // Make a request to open the connection
+            val makeFirstReq = client.expect[String](req)
+            val waitForServerToShutdown = IO.sleep(shutdownServerDelay)
+            // Before the connection is reaped, make enough requests to fill up the write queue
+            val makeManyConcurrentRequests = Stream[IO, Request[IO]](req)
+              .repeatN(60)
+              .parEvalMapUnbounded(client.expect[String])
+              .compile
+              .drain
+            makeFirstReq >> waitForServerToShutdown >> makeManyConcurrentRequests
+          }
+        }
+        (startAndShutdownServer, runClient).parTupled.void
+      }
+      // The test doesn't timeout because resource finalizers are blocked on the write queue.
+      .timeout(5.seconds)
+    (simulateDeadlock, IO.sleep(4.seconds) >> printFiberDump).parTupled.void
+  }
+  import org.typelevel.log4cats.slf4j.Slf4jLogger
+  def printFiberDump: IO[Unit] =
+    for {
+      logger <- Slf4jLogger.create[IO]
+      snapshot <- IO.delay(implicitly[IORuntime].liveFiberSnapshot())
+      // print fibers assigned to specific worker threads
+      // `workers` API is available only on JVM and Scala Native platforms
+      _ <- snapshot.workers.toList.traverse_ { case (worker, fibers) =>
+        logger.info(s"Worker ${worker.thread} #${worker.index}") >> fibers.traverse_(fiber =>
+          logger.info(fiber.pretty)
+        )
+      }
+      // print global fibers (not bound to specific workers, e.g., blocked or external)
+      _ <- logger.info("Global")
+      _ <- snapshot.external.traverse_(fiber => logger.info(fiber.pretty))
+    } yield ()
 }

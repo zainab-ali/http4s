@@ -306,16 +306,26 @@ private[ember] class H2Client[F[_]](
       )
       // Stream Order Must Be Correct, so we must grab the global lock
       stream <- Resource.make(
-        connection.streamCreateAndHeaders.use(_ =>
-          connection.initiateLocalStream.flatMap(stream =>
-            stream.sendHeaders(PseudoHeaders.requestToHeaders(req), endStream = false).as(stream)
+        connection.logSize("streamCreateAndHeaders") >> connection.streamCreateAndHeaders.use(_ =>
+          connection.logSize("initiateLocalStream") >> connection.initiateLocalStream.flatMap(
+            stream =>
+              connection.logSize("sendHeaders") >> stream
+                .sendHeaders(PseudoHeaders.requestToHeaders(req), endStream = false)
+                .as(stream)
           )
         )
       )(stream =>
-        connection.state.get.map(_.closed).ifM(F.unit, stream.finish(H2Error.Cancel).start.void) >>
-          connection.mapRef.update(m => m - stream.id)
+        connection.logSize("stream finalizer") >> connection.state.get
+          .map(_.closed)
+          .ifM(
+            F.unit,
+            connection.logSize("stream.finish") >> stream.finish(H2Error.Cancel).start.void,
+          ) >> connection.mapRef.update(m => m - stream.id)
       )
-      _ <- (stream.sendMessageBody(req) >> stream.sendTrailerHeaders(req)).background
+      _ <- (connection.logSize("sendMessageBody") >> stream.sendMessageBody(req) >> connection
+        .logSize(
+          "sendTrailerHeaders"
+        ) >> stream.sendTrailerHeaders(req)).background
       resp <- Resource.eval(stream.getResponse).map(_.covary[F].withBodyStream(stream.readBody))
     } yield resp
   }
