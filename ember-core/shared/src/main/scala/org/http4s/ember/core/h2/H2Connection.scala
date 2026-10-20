@@ -365,7 +365,7 @@ private[h2] class H2Connection[F[_]](
         Stream.exec(
           logger.debug(ex)("writeLoop terminated") >>
             state.update(_.copy(closed = true))
-        )
+        ) ++ Stream.fromQueueUnterminated[F, H2Frame](outgoingQueue, 16).drain
       )
 
   def readLoop: F[Unit] = {
