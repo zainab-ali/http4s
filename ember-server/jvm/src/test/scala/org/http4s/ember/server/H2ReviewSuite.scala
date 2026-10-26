@@ -105,4 +105,36 @@ class H2ReviewSuite extends Http4sSuite {
       Stream.repeatEval(program).take(10).compile.drain.timeout(8.seconds)
     }
   }
+
+  test("max concurrent streams is respected".only) {
+    // The server terminates before a response is sent
+    val app = HttpApp[IO](_ => IO.never)
+    val server = EmberServerBuilder
+      .default[IO]
+      .withHost(ipv4"127.0.0.1")
+      .withPort(port"0")
+      .withHttp2
+      .withHttpApp(app)
+      .build
+    val client = EmberClientBuilder
+      .default[IO]
+      .withHttp2
+      .build
+
+    (client, server).tupled.use { case (client, server) =>
+      val uri = Uri.unsafeFromString(s"http://127.0.0.1:${server.addressIp4s.port.value}/")
+      val req = Request[IO](Method.POST, uri)
+        .withEntity("Somebody")
+        .withAttribute(Http2PriorKnowledge, ())
+      // Make more requests than the server's MAX_CONCURRENT_STREAMS value.
+      Stream(client.expect[String](req))
+        .repeatN(1000)
+        .covary[IO]
+        .parEvalMapUnbounded(identity(_))
+        .compile
+        .drain
+    // The client does not limit requests.
+    // The server issues a GoAway and a request ultimately raises an error.
+    }
+  }
 }

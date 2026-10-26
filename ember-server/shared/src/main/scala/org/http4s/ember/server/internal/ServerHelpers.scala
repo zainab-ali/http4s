@@ -212,6 +212,8 @@ private[server] object ServerHelpers extends ServerHelpersPlatform {
   ): Stream[F, Nothing] = {
     val h2FrameSettings = H2Frame.Settings.ConnectionSettings.default
       .copy(maxHeaderListSize = Some(H2Frame.Settings.SettingsMaxHeaderListSize(maxHeaderSize)))
+      // Limit the number of concurrent streams to showcase the client misbehaving
+      .copy(maxConcurrentStreams = H2Frame.Settings.SettingsMaxConcurrentStreams(128))
 
     val streams: Stream[F, Stream[F, Nothing]] = server
       .interruptWhen(shutdown.signal.attempt)
